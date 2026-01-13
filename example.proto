@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+package ecommerce;
+
+// User model
+message User {
+  string id = 1; // user UUID
+  string username = 2;
+  string email = 3;
+  bool is_active = 4;
+}
+
+// Order with a list of products
+message Order {
+  string order_id = 1; // order UUID
+  double total_price = 2;
+  repeated string items = 3;
+  User buyer = 4;
+}
+
+// Request to retrieve an order
+message GetOrderRequest {
+  string id = 1;
+}
+
+// Service definition to be converted into a Go interface
+service OrderService {
+  rpc GetOrder(GetOrderRequest) returns (Order);
+  rpc CreateOrder(Order) returns (Order);
+}
