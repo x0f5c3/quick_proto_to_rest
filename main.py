@@ -10,6 +10,7 @@ import re
 import sys
 import json
 import logging
+import subprocess
 import click
 from rich.logging import RichHandler
 
@@ -74,8 +75,34 @@ def map_type(proto_type):
         'bool': 'bool',
         'string': 'string',
         'bytes': '[]byte',
+        # Well-known types mapping
+        'google.protobuf.Timestamp': 'time.Time',
+        'Timestamp': 'time.Time',
     }
     return type_mapping.get(proto_type, proto_type)
+
+def run_gofmt(code: str) -> str:
+    """Formats Go code using gofmt via stdin/stdout without temp files."""
+    logger = logging.getLogger("converter")
+    
+    try:
+        # Run gofmt, passing code to stdin
+        process = subprocess.run(
+            ["gofmt"],
+            input=code.encode("utf-8"),
+            capture_output=True,
+            check=True
+        )
+        logger.info("Code formatted successfully with gofmt.")
+        return process.stdout.decode("utf-8")
+        
+    except FileNotFoundError:
+        logger.warning("The 'gofmt' executable was not found in PATH. Skipping formatting.")
+        return code
+    except subprocess.CalledProcessError as e:
+        logger.error(f"gofmt failed to format code:\n{e.stderr.decode('utf-8')}")
+        # Return original code if formatting fails, so the user doesn't lose output
+        return code
 
 def parse_proto_and_generate_go(input_file, package_name):
     logger = logging.getLogger("converter")
@@ -91,12 +118,18 @@ def parse_proto_and_generate_go(input_file, package_name):
     imports = {"\"context\""}
     body_code = []
     
-    state = "NONE" # NONE, MESSAGE, SERVICE
+    state = "NONE" # NONE, MESSAGE, SERVICE, ENUM
+    current_enum_name = ""
+    is_first_enum_field = False
     
     message_regex = re.compile(r'message\s+(\w+)\s*\{')
     service_regex = re.compile(r'service\s+(\w+)\s*\{')
+    enum_regex = re.compile(r'enum\s+(\w+)\s*\{')
+    
+    # Regex fields
     field_regex = re.compile(r'\s*(repeated)?\s*([\w\.]+)\s+(\w+)\s*=\s*\d+;')
     rpc_regex = re.compile(r'\s*rpc\s+(\w+)\s*\(([^)]+)\)\s*returns\s*\(([^)]+)\)')
+    enum_field_regex = re.compile(r'\s*(\w+)\s*=\s*\d+;')
     
     line_count = 0
 
@@ -124,6 +157,18 @@ def parse_proto_and_generate_go(input_file, package_name):
             state = "MESSAGE"
             continue
 
+        # Detect Enum
+        enum_match = enum_regex.search(code_part)
+        if enum_match:
+            current_enum_name = enum_match.group(1)
+            logger.debug(f"Found enum definition: [yellow]{current_enum_name}[/]", extra={"markup": True})
+            body_code.append(f"// {current_enum_name} is an enumeration based on byte")
+            body_code.append(f"type {current_enum_name} byte")
+            body_code.append("const (")
+            state = "ENUM"
+            is_first_enum_field = True
+            continue
+
         # Detect Service
         svc_match = service_regex.search(code_part)
         if svc_match:
@@ -135,13 +180,17 @@ def parse_proto_and_generate_go(input_file, package_name):
             continue
 
         # Detect End Block
-        if code_part == '}' and state in ["MESSAGE", "SERVICE"]:
-            body_code.append("}")
+        if code_part == '}' and state in ["MESSAGE", "SERVICE", "ENUM"]:
+            if state == "ENUM":
+                body_code.append(")") # Close const block
+            else:
+                body_code.append("}") # Close struct/interface
+            
             body_code.append("")
             state = "NONE"
             continue
 
-        # Process Fields
+        # Process Message Fields
         if state == "MESSAGE":
             field_match = field_regex.search(code_part)
             if field_match:
@@ -150,6 +199,10 @@ def parse_proto_and_generate_go(input_file, package_name):
                 field_name = field_match.group(3)
                 
                 go_type = map_type(proto_type)
+                
+                # Handle imports for known types
+                if go_type == "time.Time":
+                    imports.add("\"time\"")
                 
                 # Check for UUID hint
                 if "UUID" in comment_part.upper():
@@ -165,6 +218,19 @@ def parse_proto_and_generate_go(input_file, package_name):
                     go_field_name = go_field_name[:-2] + "ID"
                 
                 body_code.append(f"\t{go_field_name} {go_type} `json:\"{field_name},omitempty\"`")
+                continue
+
+        # Process Enum Values (Constants)
+        if state == "ENUM":
+            enum_field_match = enum_field_regex.search(code_part)
+            if enum_field_match:
+                val_name = enum_field_match.group(1)
+                
+                if is_first_enum_field:
+                    body_code.append(f"\t{val_name} {current_enum_name} = iota")
+                    is_first_enum_field = False
+                else:
+                    body_code.append(f"\t{val_name}")
                 continue
 
         # Process RPC
@@ -199,10 +265,11 @@ def parse_proto_and_generate_go(input_file, package_name):
 @click.option('--package', '-p', default='models', help='Go package name for the generated file.', show_default=True)
 @click.option('--output', '-o', type=click.Path(writable=True), help='Output file path. If not provided, prints to stdout.')
 @click.option('--verbose', '-v', is_flag=True, help='Enable verbose debug logging.')
+@click.option('--format', '-f', 'should_format', is_flag=True, help='Run gofmt on the generated code.')
 @click.option('--log-file', default='converter.log', help='Path to the JSON log file.', show_default=True)
-def main(input_proto, package, output, verbose, log_file):
+def main(input_proto, package, output, verbose, should_format, log_file):
     """
-    Converts a .proto file to a pure Go file with structs and interfaces.
+    Converts a .proto file to a pure Go file with structs, enums, and interfaces.
     
     Designed for REST API migrations, avoiding gRPC dependencies.
     """
@@ -212,13 +279,15 @@ def main(input_proto, package, output, verbose, log_file):
     try:
         go_code = parse_proto_and_generate_go(input_proto, package)
         
+        if should_format:
+            go_code = run_gofmt(go_code)
+        
         if output:
             with open(output, 'w') as f:
                 f.write(go_code)
             logger.info(f"Successfully wrote generated code to: [bold green]{output}[/]", extra={"markup": True})
         else:
             # Print to stdout for piping. 
-            # Note: Logs are sent to stderr by RichHandler, so this remains clean.
             print(go_code)
             logger.info("Output sent to stdout")
 

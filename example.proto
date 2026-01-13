@@ -2,12 +2,23 @@ syntax = "proto3";
 
 package ecommerce;
 
+import "google/protobuf/timestamp.proto";
+
+// Enum definition
+enum OrderStatus {
+  UNKNOWN = 0;
+  PENDING = 1;
+  SHIPPED = 2;
+  DELIVERED = 3;
+}
+
 // User model
 message User {
   string id = 1; // user UUID
   string username = 2;
   string email = 3;
   bool is_active = 4;
+  google.protobuf.Timestamp created_at = 5;
 }
 
 // Order with a list of products
@@ -16,14 +27,14 @@ message Order {
   double total_price = 2;
   repeated string items = 3;
   User buyer = 4;
+  OrderStatus status = 5;
+  google.protobuf.Timestamp order_date = 6;
 }
 
-// Request to retrieve an order
 message GetOrderRequest {
   string id = 1;
 }
 
-// Service definition to be converted into a Go interface
 service OrderService {
   rpc GetOrder(GetOrderRequest) returns (Order);
   rpc CreateOrder(Order) returns (Order);
